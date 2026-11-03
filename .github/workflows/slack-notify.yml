@@ -1,0 +1,61 @@
+name: Slack notify
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    # Skip branch deletions (no commits to report)
+    if: github.event_name != 'push' || github.event.deleted != true
+    steps:
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL secret is not set; skipping Slack notification."
+            exit 0
+          fi
+
+          # All event data is read from the event payload via jq (no
+          # untrusted values are interpolated into the shell script).
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              text=$(jq -r --arg actor "$GITHUB_ACTOR" '
+                (.commits | length) as $n
+                | (.ref | sub("^refs/heads/"; "")) as $branch
+                | ":hammer: \($actor) pushed \($n) commit\(if $n == 1 then "" else "s" end) to `\($branch)`\n"
+                  + "> \((.head_commit.message // "") | split("\n")[0])\n"
+                  + "<\(.compare)|Compare changes>"
+              ' "$GITHUB_EVENT_PATH")
+              ;;
+            pull_request)
+              text=$(jq -r '
+                .pull_request as $pr
+                | if .action == "closed" and $pr.merged == true then
+                    ":white_check_mark: PR #\($pr.number) merged into `\($pr.base.ref)` by \($pr.merged_by.login // .sender.login): \($pr.title)\n<\($pr.html_url)|View PR>"
+                  else
+                    ":twisted_rightwards_arrows: PR #\($pr.number) \(.action) by \(.sender.login): \($pr.title)\n<\($pr.html_url)|View PR>"
+                  end
+              ' "$GITHUB_EVENT_PATH")
+              ;;
+            *)
+              echo "Unhandled event: $GITHUB_EVENT_NAME"
+              exit 0
+              ;;
+          esac
+
+          payload=$(jq -n --arg text "$text" '{text: $text}')
+          curl -sS --fail-with-body -X POST \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"

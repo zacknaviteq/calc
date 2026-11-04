@@ -40,20 +40,22 @@ variable "root_volume_size" {
   default     = 8
 }
 
-variable "github_repository" {
-  description = "GitHub repository (owner/name) allowed to assume the deploy role."
-  type        = string
-  default     = "zacknaviteq/calc"
-}
-
-variable "github_branch" {
-  description = "Branch allowed to assume the deploy role."
-  type        = string
-  default     = "main"
-}
-
 variable "ecr_images_to_keep" {
   description = "Number of images kept in ECR."
   type        = number
   default     = 5
+}
+
+variable "github_oidc_subjects" {
+  description = <<-EOT
+    Allowed GitHub OIDC `sub` claims for the deploy role. This repo uses GitHub's
+    immutable subject format (repo:OWNER@OWNER_ID/REPO@REPO_ID:...), which survives
+    renames; the legacy name-based format is kept in case the repo setting is reverted.
+    Both are pinned to the main branch of zacknaviteq/calc.
+  EOT
+  type        = list(string)
+  default = [
+    "repo:zacknaviteq@346338069/calc@1444362044:ref:refs/heads/main",
+    "repo:zacknaviteq/calc:ref:refs/heads/main",
+  ]
 }

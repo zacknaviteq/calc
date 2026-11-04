@@ -1,0 +1,22 @@
+#!/bin/bash
+# Bootstraps Docker and starts the calc container (if an image exists yet).
+set -euxo pipefail
+
+dnf install -y docker
+systemctl enable --now docker
+
+# Deploy helper, also usable manually via SSM Session Manager.
+cat > /usr/local/bin/calc-deploy <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+IMAGE="$${1:-${image}}"
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+docker pull "$IMAGE"
+docker rm -f ${container} 2>/dev/null || true
+docker run -d --name ${container} --restart always -p 80:80 "$IMAGE"
+docker image prune -af
+SCRIPT
+chmod 0755 /usr/local/bin/calc-deploy
+
+# On first boot the ECR repo may still be empty; the pipeline deploys later.
+/usr/local/bin/calc-deploy || echo "No image yet; waiting for first pipeline deploy."

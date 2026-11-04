@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tailoring of the SSG "DISA STIG for RHEL 9" profile for a container image.
+  Each deviation is documented and lands in the evidence bundle.
+-->
+<xccdf-1.2:Tailoring xmlns:xccdf-1.2="http://checklists.nist.gov/xccdf/1.2" id="xccdf_io.naviteq_tailoring_calc_hardened">
+  <xccdf-1.2:benchmark href="/ssg/ssg-rhel9-ds.xml"/>
+  <xccdf-1.2:version time="2026-11-04T00:00:00">1</xccdf-1.2:version>
+  <xccdf-1.2:Profile id="xccdf_io.naviteq_profile_stig_container" extends="xccdf_org.ssgproject.content_profile_stig">
+    <xccdf-1.2:title>DISA STIG for RHEL 9, tailored for the calc hardened container image</xccdf-1.2:title>
+    <xccdf-1.2:description>
+      (1) var_system_crypto_policy: FIPS:STIG -> FIPS. The UBI 9 crypto-policies
+          package does not ship the STIG sub-policy module, so FIPS:STIG cannot be
+          set in a UBI image. FIPS is the policy required by RHEL-09-215100 and
+          restricts OpenSSL to the FIPS 140-3 validated provider.
+      (2) network_configure_name_resolution: deselected. /etc/resolv.conf is
+          injected by the container runtime at start, not part of the image.
+      security_patches_up_to_date stays in the profile; it is reported as
+      notchecked offline and is covered by "dnf upgrade" at build time and the
+      Trivy CVE gate.
+    </xccdf-1.2:description>
+    <xccdf-1.2:select idref="xccdf_org.ssgproject.content_rule_network_configure_name_resolution" selected="false"/>
+    <xccdf-1.2:refine-value idref="xccdf_org.ssgproject.content_value_var_system_crypto_policy" selector="fips"/>
+  </xccdf-1.2:Profile>
+</xccdf-1.2:Tailoring>

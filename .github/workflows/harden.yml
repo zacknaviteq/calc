@@ -1,0 +1,304 @@
+name: Harden image (STIG + FIPS)
+
+# Rebuilds the calc image from ECR `calc` onto Red Hat UBI 9, scans it before
+# and after (Trivy, Dockle, OpenSCAP RHEL 9 STIG, FIPS checks), gates it, then
+# pushes a signed image to ECR `hardened-images`, stores the evidence in S3
+# (Object Lock) and posts everything to Slack. See hardening/README.md.
+
+on:
+  workflow_run:
+    workflows: ["Build and deploy"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source image in ECR calc: a tag (e.g. a commit SHA or 'latest') or a digest (sha256:...)"
+        required: true
+        default: latest
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC: picks up new UBI errata
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harden
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  SOURCE_REPOSITORY: calc
+  TARGET_REPOSITORY: hardened-images
+  EVIDENCE_BUCKET: ${{ vars.HARDEN_EVIDENCE_BUCKET || 'calc-hardening-evidence-960410382237' }}
+  SLACK_CHANNEL_ID: ${{ vars.HARDEN_SLACK_CHANNEL_ID || 'C0CE6TC357B' }}
+  STIG_MIN_PASS_RATE: "95"
+  STIG_MAX_FAIL: "0"
+  TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+  W: ${{ github.workspace }}/out
+
+jobs:
+  harden:
+    name: Harden calc image
+    # Only after a successful push-to-main deploy (not PR builds), or manual / scheduled runs.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC + cosign keyless signing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools (Trivy, Dockle, Syft, cosign)
+        run: |
+          bash hardening/scripts/install-tools.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.HARDEN_ROLE_ARN || 'arn:aws:iam::960410382237:role/calc-github-harden' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@aded0d722166a37980e030aa969dda0bfe6b6947 # v2.1.7
+
+      - name: Resolve source image digest
+        id: src
+        env:
+          INPUT_SOURCE: ${{ github.event.inputs.source }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            workflow_run) ref="$RUN_SHA" ;;
+            workflow_dispatch) ref="${INPUT_SOURCE:-latest}" ;;
+            *) ref=latest ;;
+          esac
+          if [[ "$ref" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            id="imageDigest=$ref"
+          elif [[ "$ref" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+            id="imageTag=$ref"
+          else
+            echo "::error::Invalid source reference"; exit 1
+          fi
+          aws ecr describe-images --repository-name "$SOURCE_REPOSITORY" --image-ids "$id" \
+            --query 'imageDetails[0]' --output json > src.json
+          digest=$(jq -r .imageDigest src.json)
+          # The commit SHA tag the deploy pipeline pushed, else the digest prefix.
+          sha=$(jq -r '[.imageTags[]? | select(test("^[0-9a-f]{40}$"))][0] // empty' src.json)
+          short=${sha:-${digest#sha256:}}; short=${short:0:12}
+          {
+            echo "digest=$digest"
+            echo "sha=${sha:-unknown}"
+            echo "image=$REGISTRY/$SOURCE_REPOSITORY@$digest"
+            echo "target_tag=calc-${short}-${GITHUB_RUN_NUMBER}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source: $REGISTRY/$SOURCE_REPOSITORY@$digest (ref $ref, commit ${sha:-unknown})"
+
+      - name: Pull source and build scanner
+        env:
+          SRC: ${{ steps.src.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/before" "$W/after" "$W/images"
+          docker pull "$SRC"
+          docker build -q -t harden-scanner hardening/scanner
+
+      # ---------------------------------------------------------------- BEFORE
+      - name: BEFORE report (source image)
+        env:
+          IMG: ${{ steps.src.outputs.image }}
+        run: bash hardening/scripts/scan.sh before "$IMG"
+
+      # ----------------------------------------------------------------- BUILD
+      - name: Build hardened image (UBI 9, errata, FIPS policy, STIG remediations)
+        env:
+          SRC: ${{ steps.src.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --pull -f hardening/Containerfile \
+            --build-arg SOURCE_IMAGE="$SRC" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label io.naviteq.hardening.source-image="$SRC" \
+            --label io.naviteq.hardening.run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -t calc-hardened:candidate . 2>&1 | tee "$W/after/build.log"
+
+      - name: Smoke test (read-only rootfs, no capabilities, non-root)
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:8080 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /run/nginx:rw,uid=1001,gid=1001,mode=0750 \
+            --tmpfs /var/lib/nginx/tmp:rw,uid=1001,gid=1001,mode=0750 \
+            calc-hardened:candidate
+          ok=fail
+          for _ in $(seq 1 20); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/src/web-calculator.html; then ok=pass; break; fi
+            sleep 1
+          done
+          {
+            echo "page: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/src/web-calculator.html)"
+            echo "healthz: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)"
+            echo "POST (expect 405): $(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/)"
+            echo "dotfile (expect 403): $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/.env)"
+            echo "process user: $(docker exec smoke id -u 2>/dev/null || docker top smoke -o user | tail -n +2 | sort -u | tr '\n' ' ')"
+            curl -sI http://127.0.0.1:8080/src/web-calculator.html
+          } > "$W/after/smoke-test.txt" 2>&1 || true
+          docker logs smoke > "$W/after/smoke-container.log" 2>&1 || true
+          docker rm -f smoke >/dev/null
+          cat "$W/after/smoke-test.txt"
+          echo "$ok" > "$W/after/smoke.result"
+          [ "$ok" = pass ]
+
+      # ----------------------------------------------------------------- AFTER
+      - name: AFTER report (hardened image)
+        if: ${{ !cancelled() }}
+        run: bash hardening/scripts/scan.sh after calc-hardened:candidate
+
+      - name: Gate
+        id: gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python3 hardening/scripts/report.py before "$W"
+          python3 hardening/scripts/report.py after "$W" \
+            --stig-min-pass-rate "$STIG_MIN_PASS_RATE" --stig-max-fail "$STIG_MAX_FAIL"
+          cat "$W/diff.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "result=$(jq -r .result "$W/gate.json")" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------ PUSH + SIGN + ATTEST
+      - name: Push, sign and attest
+        id: push
+        if: ${{ !cancelled() && steps.gate.outputs.result == 'pass' }}
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.src.outputs.target_tag }}
+          SRC_DIGEST: ${{ steps.src.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$TARGET_REPOSITORY"
+          docker tag calc-hardened:candidate "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          digest=$(aws ecr describe-images --repository-name "$TARGET_REPOSITORY" --image-ids "imageTag=$TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          REF="$IMAGE@$digest"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          cosign sign --yes "$REF"
+          cosign attest --yes --type spdxjson --predicate "$W/after/sbom.spdx.json" "$REF"
+          jq -n --slurpfile s "$W/after/summary.json" --slurpfile g "$W/gate.json" \
+             --arg src "$SRC_DIGEST" --arg results_sha256 "$(sha256sum "$W/after/stig-results.xml" | cut -d' ' -f1)" \
+             '{scanner:"OpenSCAP", content:"SCAP Security Guide 0.1.82 ssg-rhel9-ds.xml",
+               profile:$s[0].stig.profile, results:$s[0].stig.results, pass_rate:$s[0].stig.pass_rate,
+               failed:$s[0].stig.failed, fips:$s[0].fips.result, gate:$g[0].result,
+               source_image_digest:$src, xccdf_results_sha256:$results_sha256}' > "$W/after/scap-predicate.json"
+          cosign attest --yes --type https://naviteq.io/attestations/openscap-stig/v1 \
+            --predicate "$W/after/scap-predicate.json" "$REF"
+
+          id="^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/harden.yml@refs/heads/main$"
+          iss=https://token.actions.githubusercontent.com
+          cosign verify --certificate-identity-regexp "$id" --certificate-oidc-issuer "$iss" "$REF" > "$W/after/cosign-verify.json"
+          cosign verify-attestation --type spdxjson --certificate-identity-regexp "$id" --certificate-oidc-issuer "$iss" "$REF" > /dev/null
+          echo "Pushed and signed $REF"
+          echo "### Pushed \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------------------------------------- EVIDENCE
+      - name: Evidence bundle
+        id: evidence
+        if: ${{ !cancelled() && steps.gate.outcome != 'skipped' }}
+        env:
+          SRC: ${{ steps.src.outputs.image }}
+          SRC_SHA: ${{ steps.src.outputs.sha }}
+          REF: ${{ steps.push.outputs.ref }}
+          GATE: ${{ steps.gate.outputs.result }}
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" "$W"
+          cp hardening/Containerfile hardening/stig-remediate.sh hardening/stig-tailoring.xml hardening/nginx.conf "$W/"
+          jq -n --arg src "$SRC" --arg src_sha "$SRC_SHA" --arg out "${REF:-not pushed}" --arg gate "$GATE" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg commit "$GITHUB_SHA" \
+            --arg trigger "$GITHUB_EVENT_NAME" --arg at "$(date -u +%FT%TZ)" \
+            '{source_image:$src, source_commit:$src_sha, hardened_image:$out, gate:$gate, run:$run,
+              pipeline_commit:$commit, trigger:$trigger, created_at:$at}' > "$W/manifest.json"
+          name="calc-hardening-evidence-${SRC_SHA:0:12}-run${GITHUB_RUN_ID}.zip"
+          rm -rf "$W/images"
+          (cd "$W" && find . -type f ! -name '*.zip' ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS && zip -qr "../$name" .)
+          mv "$GITHUB_WORKSPACE/$name" "$W/$name"
+          key="calc/${SRC_SHA}/${GITHUB_RUN_ID}/${name}"
+          aws s3 cp "$W/$name" "s3://$EVIDENCE_BUCKET/$key" --checksum-algorithm SHA256 --only-show-errors
+          echo "zip=$W/$name" >> "$GITHUB_OUTPUT"
+          echo "s3=s3://$EVIDENCE_BUCKET/$key" >> "$GITHUB_OUTPUT"
+          echo "Evidence: s3://$EVIDENCE_BUCKET/$key"
+
+      - name: Upload evidence artifact
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hardening-evidence-${{ github.run_id }}
+          path: ${{ steps.evidence.outputs.zip }}
+          retention-days: 90
+
+      # ----------------------------------------------------------------- SLACK
+      - name: Post to Slack
+        if: ${{ always() }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SRC: ${{ steps.src.outputs.image }}
+          REF: ${{ steps.push.outputs.ref }}
+          TAG: ${{ steps.push.outputs.tag }}
+          S3: ${{ steps.evidence.outputs.s3 }}
+          ZIP: ${{ steps.evidence.outputs.zip }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+            echo "::warning::SLACK_BOT_TOKEN secret is not set; skipping Slack."; exit 0
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -f "$W/after/summary.json" ] && [ -f "$W/before/summary.json" ] && [ -f "$W/gate.json" ]; then
+            jq -r -n --slurpfile b "$W/before/summary.json" --slurpfile a "$W/after/summary.json" --slurpfile g "$W/gate.json" \
+              --arg src "$SRC" --arg ref "${REF:-}" --arg tag "${TAG:-}" --arg s3 "${S3:-}" --arg run "$run_url" '
+              def sev(s): "C \(s.trivy.by_severity.CRITICAL) / H \(s.trivy.by_severity.HIGH) / M \(s.trivy.by_severity.MEDIUM) (fixable \(s.trivy.fixable|add))";
+              def stig(s): if s.stig and s.stig.evaluated == 0 then "n/a (not RHEL)" elif s.stig then "\(s.stig.results.pass // 0) pass / \(s.stig.results.fail // 0) fail (\(s.stig.pass_rate)%)" else "n/a" end;
+              ($b[0]) as $B | ($a[0]) as $A | ($g[0]) as $G |
+              (if $G.result == "pass" then ":white_check_mark: *Hardening PASSED*" else ":x: *Hardening FAILED (gate)*" end) + "  calc → hardened-images\n"
+              + "*Source:* `\($src)`\n"
+              + (if $ref != "" then "*Hardened:* `\($ref)` (tag `\($tag)`), signed with cosign (keyless)\n" else "*Hardened:* not pushed\n" end)
+              + "```\n"
+              + "            BEFORE                                AFTER\n"
+              + "Base        \($B.trivy.os|.[0:28]|. + " " * (38 - length))\($A.trivy.os)\n"
+              + "User        \(($B.meta.user // "?")|tostring|. + " " * (38 - length))\($A.meta.user // "?")\n"
+              + "CVEs        \(sev($B)|. + " " * (38 - length))\(sev($A))\n"
+              + "Dockle      \("FATAL \($B.dockle.fatal) WARN \($B.dockle.warn)"|. + " " * (38 - length))FATAL \($A.dockle.fatal) WARN \($A.dockle.warn)\n"
+              + "STIG        \(stig($B)|. + " " * (38 - length))\(stig($A))\n"
+              + "FIPS        \(($B.fips.result)|. + " " * (38 - length))\($A.fips.result)\n"
+              + "```\n"
+              + ([$G.checks[] | (if .ok then ":white_check_mark: " else ":x: " end) + .name + " — " + .detail] | join("\n")) + "\n"
+              + (if $s3 != "" then "*Evidence:* `\($s3)` (Object Lock)\n" else "" end)
+              + "<\($run)|Workflow run>"' > "$W/slack.txt"
+          else
+            printf ':x: *Hardening run failed before reports were produced* (%s)\n<%s|Workflow run>\n' "$JOB_STATUS" "$run_url" > "$W/slack.txt"
+          fi
+          files=()
+          [ -f "$W/before/report.md" ] && cp "$W/before/report.md" "$W/before-report.md" && files+=("$W/before-report.md")
+          [ -f "$W/after/report.md" ] && cp "$W/after/report.md" "$W/after-report.md" && files+=("$W/after-report.md")
+          [ -f "$W/after/stig-report.html" ] && cp "$W/after/stig-report.html" "$W/stig-after.html" && files+=("$W/stig-after.html")
+          [ -n "${ZIP:-}" ] && [ -f "$ZIP" ] && files+=("$ZIP")
+          bash hardening/scripts/slack-post.sh "$W/slack.txt" "${files[@]}"
+
+      - name: Fail if gate failed
+        if: ${{ !cancelled() && steps.gate.outputs.result != 'pass' }}
+        run: |
+          echo "::error::Hardening gate failed; image not pushed. See the job summary and Slack."
+          exit 1

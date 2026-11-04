@@ -1,0 +1,17 @@
+# OpenSCAP scanner with SCAP Security Guide (RHEL 9 STIG content), both pinned.
+# Scans an exported image root filesystem mounted at /target via
+# OSCAP_PROBE_ROOT (the same mechanism oscap-podman / oscap-chroot use).
+FROM registry.access.redhat.com/ubi9/ubi@sha256:a13ba2d8404f5eb59522fc5a6c1b852203d91d4f23e91d5ae3f14fcf4b3c66a6
+ARG OPENSCAP_VERSION=1.3.14-1.el9_8
+ARG SSG_VERSION=0.1.82
+ARG SSG_SHA256=765e84bdce7f9055f9b9c2dd0ee2b713d4255f8eec94eac6d35ea4973c28919c
+RUN dnf -y --setopt=install_weak_deps=0 install "openscap-scanner-${OPENSCAP_VERSION}" unzip \
+ && dnf clean all \
+ && curl -fsSL -o /tmp/ssg.zip "https://github.com/ComplianceAsCode/content/releases/download/v${SSG_VERSION}/scap-security-guide-${SSG_VERSION}.zip" \
+ && echo "${SSG_SHA256}  /tmp/ssg.zip" | sha256sum -c - \
+ && mkdir -p /ssg \
+ && unzip -q -j /tmp/ssg.zip "scap-security-guide-${SSG_VERSION}/ssg-rhel9-ds.xml" -d /ssg \
+ && rm -f /tmp/ssg.zip \
+ && oscap --version | head -1
+ENV OSCAP_PROBE_ROOT=/target
+ENTRYPOINT ["oscap"]

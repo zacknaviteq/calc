@@ -1,0 +1,53 @@
+# Hardened rebuild of the calc image onto Red Hat UBI 9 (STIG + FIPS).
+#
+# The static site is copied out of the source image (ECR `calc`, nginx:alpine)
+# and served by RHEL 9 nginx, linked against the RHEL 9 OpenSSL with the
+# FIPS 140-3 validated provider. The final image is a ubi-micro root
+# filesystem populated with --installroot, so it contains no package manager.
+#
+# Base images are pinned by digest (amd64). Bump them in a PR; the weekly run
+# still picks up new errata because `dnf upgrade` runs at build time.
+
+ARG SOURCE_IMAGE
+ARG UBI_IMAGE=registry.access.redhat.com/ubi9/ubi@sha256:a13ba2d8404f5eb59522fc5a6c1b852203d91d4f23e91d5ae3f14fcf4b3c66a6
+ARG UBI_MICRO_IMAGE=registry.access.redhat.com/ubi9/ubi-micro@sha256:7325ffb45d8401b227033dc26c567e138c919731ed2f8119e921ddba71835f87
+
+FROM ${SOURCE_IMAGE} AS source
+
+FROM ${UBI_MICRO_IMAGE} AS micro
+
+FROM ${UBI_IMAGE} AS build
+ARG NGINX_STREAM=1.26
+ARG APP_UID=1001
+COPY --from=micro / /rootfs
+RUN set -eux; R=/rootfs; \
+    DNF="dnf -y --installroot=$R --releasever=9 --setopt=install_weak_deps=0 --setopt=tsflags=nodocs"; \
+    $DNF module enable nginx:${NGINX_STREAM}; \
+    # Apply all available errata to the base, then add only what nginx needs.
+    $DNF upgrade; \
+    $DNF install nginx-core crypto-policies openssl openssl-fips-provider; \
+    $DNF clean all; \
+    rm -rf $R/var/cache/dnf $R/var/log/dnf* $R/var/log/hawkey.log $R/var/lib/dnf
+# System crypto policy: FIPS (crypto-policies-scripts only lives in the build
+# stage; we generate the back-ends there and copy them in).
+RUN set -eux; dnf -y --setopt=install_weak_deps=0 upgrade crypto-policies; \
+    dnf -y --setopt=install_weak_deps=0 install crypto-policies-scripts; \
+    update-crypto-policies --set FIPS --no-reload; \
+    rm -rf /rootfs/etc/crypto-policies; cp -a /etc/crypto-policies /rootfs/etc/crypto-policies; \
+    cat /rootfs/etc/crypto-policies/config /rootfs/etc/crypto-policies/state/current
+COPY hardening/stig-remediate.sh /tmp/stig-remediate.sh
+COPY hardening/nginx.conf /rootfs/etc/nginx/nginx.conf
+COPY --from=source /usr/share/nginx/html /rootfs/usr/share/nginx/html
+RUN APP_UID=${APP_UID} bash /tmp/stig-remediate.sh /rootfs
+
+FROM scratch
+COPY --from=build /rootfs /
+ENV OPENSSL_FORCE_FIPS_MODE=1 \
+    LANG=C.UTF-8
+USER 1001:1001
+EXPOSE 8080
+STOPSIGNAL SIGQUIT
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD ["/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+ENTRYPOINT ["/usr/sbin/nginx"]
+CMD ["-g", "daemon off;"]

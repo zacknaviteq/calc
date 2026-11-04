@@ -1,0 +1,9 @@
+.git
+.github
+infra
+Dockerfile
+.dockerignore
+README.md
+LICENSE
+**/.terraform
+**/*.tfstate*

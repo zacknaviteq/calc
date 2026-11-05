@@ -24,3 +24,8 @@ After apply, set these GitHub repo variables from the outputs:
 Manual redeploy on the instance (SSM Session Manager): `sudo /usr/local/bin/calc-deploy`.
 
 Rollback: `terraform destroy`.
+
+## Image hardening (`hardening.tf`)
+ECR `hardened-images`, the evidence bucket `calc-hardening-evidence-<account>` (Object Lock governance 365d, Glacier after 90d) and the OIDC role `calc-github-harden` used by `.github/workflows/harden.yml`. Set the repo variable `HARDEN_ROLE_ARN` from `terraform output github_harden_role_arn`. See `hardening/README.md`.
+
+The evidence bucket has Object Lock, so `terraform destroy` cannot delete it while locked objects exist.

@@ -59,3 +59,21 @@ variable "github_oidc_subjects" {
     "repo:zacknaviteq/calc:ref:refs/heads/main",
   ]
 }
+
+variable "hardened_images_to_keep" {
+  description = "Number of calc-* images kept in the hardened-images ECR repository."
+  type        = number
+  default     = 20
+}
+
+variable "evidence_retention_days" {
+  description = "Object Lock (governance) default retention for hardening evidence, in days."
+  type        = number
+  default     = 365
+}
+
+variable "evidence_glacier_after_days" {
+  description = "Days before hardening evidence moves to S3 Glacier Flexible Retrieval."
+  type        = number
+  default     = 90
+}

@@ -55,7 +55,7 @@ user=$(docker image inspect -f '{{.Config.User}}' "$IMG"); user=${user:-root}
 ports=$(docker image inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$IMG" | xargs)
 size=$(docker image inspect -f '{{.Size}}' "$IMG")
 smoke=$(cat "$OUT/smoke.result" 2>/dev/null || echo "n/a")
-jq -n --arg image "$IMG" --arg digest "$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG" 2>/dev/null | sed 's/.*@//')" \
+jq -n --arg image "${SOURCE_REF:-$IMG}" --arg digest "$(docker image inspect -f '{{.Id}}' "$IMG")" \
   --arg base "$(jq -r '.Metadata.OS | "\(.Family) \(.Name)"' "$OUT/trivy.json")" --arg user "$user" --arg ports "$ports" \
   --argjson size "$size" --argjson pkgs "$(jq '.packages | length' "$OUT/sbom.spdx.json")" --arg smoke "$smoke" \
   --arg at "$(date -u +%FT%TZ)" \

@@ -105,22 +105,26 @@ jobs:
           echo "Source: $REGISTRY/$SOURCE_REPOSITORY@$digest (ref $ref, commit ${sha:-unknown})"
 
       - name: Pull source and build scanner
+        id: prep
         env:
           SRC: ${{ steps.src.outputs.image }}
         run: |
           set -euo pipefail
           mkdir -p "$W/before" "$W/after" "$W/images"
           docker pull "$SRC"
-          docker build -q -t harden-scanner hardening/scanner
+          # Local tag: docker save/inspect handle tags more reliably than digest refs.
+          docker tag "$SRC" calc-source:before
+          docker build -q -t harden-scanner -f hardening/scanner/Containerfile hardening/scanner
 
       # ---------------------------------------------------------------- BEFORE
       - name: BEFORE report (source image)
         env:
-          IMG: ${{ steps.src.outputs.image }}
-        run: bash hardening/scripts/scan.sh before "$IMG"
+          SOURCE_REF: ${{ steps.src.outputs.image }}
+        run: bash hardening/scripts/scan.sh before calc-source:before
 
       # ----------------------------------------------------------------- BUILD
       - name: Build hardened image (UBI 9, errata, FIPS policy, STIG remediations)
+        id: build
         env:
           SRC: ${{ steps.src.outputs.image }}
         run: |
@@ -162,12 +166,13 @@ jobs:
 
       # ----------------------------------------------------------------- AFTER
       - name: AFTER report (hardened image)
-        if: ${{ !cancelled() }}
+        # Runs even if the smoke test failed (the gate then fails on it), but only if an image was built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash hardening/scripts/scan.sh after calc-hardened:candidate
 
       - name: Gate
         id: gate
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           set -euo pipefail
           python3 hardening/scripts/report.py before "$W"
@@ -216,7 +221,7 @@ jobs:
       # -------------------------------------------------------------- EVIDENCE
       - name: Evidence bundle
         id: evidence
-        if: ${{ !cancelled() && steps.gate.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.gate.outcome == 'success' }}
         env:
           SRC: ${{ steps.src.outputs.image }}
           SRC_SHA: ${{ steps.src.outputs.sha }}
@@ -298,7 +303,7 @@ jobs:
           bash hardening/scripts/slack-post.sh "$W/slack.txt" "${files[@]}"
 
       - name: Fail if gate failed
-        if: ${{ !cancelled() && steps.gate.outputs.result != 'pass' }}
+        if: ${{ !cancelled() && steps.gate.outcome == 'success' && steps.gate.outputs.result != 'pass' }}
         run: |
           echo "::error::Hardening gate failed; image not pushed. See the job summary and Slack."
           exit 1

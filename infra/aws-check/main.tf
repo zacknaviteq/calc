@@ -1,5 +1,6 @@
 # calc app in the AWS Check account (899796413445, eu-north-1):
-# one EC2 instance with Docker behind an Elastic IP, port 80 open to the world,
+# one EC2 instance with Docker behind an Elastic IP, port 80 open only to
+# var.allowed_http_cidrs (empty by default: closed to the internet),
 # SSM-only access (no SSH), and an S3 bucket for deploy artifacts.
 
 data "aws_ssm_parameter" "al2023_arm64" {
@@ -58,7 +59,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
 }
 
 # ---------------------------------------------------------------------------
-# Network: HTTP from anywhere, no SSH
+# Network: HTTP only from var.allowed_http_cidrs (none by default), no SSH
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "web" {
   name        = "${local.name}-web"
@@ -67,10 +68,14 @@ resource "aws_security_group" "web" {
   tags        = { Name = "${local.name}-web" }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "http" {
+# Access from the internet is blocked: no ingress rule exists unless a CIDR
+# is added to var.allowed_http_cidrs (e.g. ["203.0.113.10/32"]).
+resource "aws_vpc_security_group_ingress_rule" "http_allowed" {
+  for_each = toset(var.allowed_http_cidrs)
+
   security_group_id = aws_security_group.web.id
-  description       = "HTTP from anywhere"
-  cidr_ipv4         = "0.0.0.0/0"
+  description       = "HTTP from an allowed network"
+  cidr_ipv4         = each.value
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Bootstraps Docker and deploys the calc app.
+set -euxo pipefail
+
+dnf install -y docker git tar gzip
+systemctl enable --now docker
+
+# Deploy helper. Usage:
+#   calc-deploy                      -> build from the main branch of the public git repo
+#   calc-deploy s3://bucket/key.tgz  -> build from a pipeline artifact
+# Also usable by hand through SSM Session Manager.
+cat > /usr/local/bin/calc-deploy <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+SRC="$${1:-}"
+WORK=$(mktemp -d /tmp/calc-deploy.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+if [ -n "$SRC" ]; then
+  aws s3 cp --region ${region} "$SRC" "$WORK/app.tgz"
+  mkdir "$WORK/src"
+  tar -xzf "$WORK/app.tgz" -C "$WORK/src"
+else
+  git clone --depth 1 --branch main ${git_repo} "$WORK/src"
+fi
+docker build -t calc:new "$WORK/src"
+docker rm -f calc 2>/dev/null || true
+docker tag calc:new calc:current
+docker run -d --name calc --restart always -p 80:80 calc:current
+docker image prune -f
+for i in $(seq 1 15); do
+  if curl -fsS -o /dev/null http://127.0.0.1/; then echo "calc is up"; exit 0; fi
+  sleep 2
+done
+echo "calc did not answer on port 80" >&2
+docker logs calc >&2 || true
+exit 1
+SCRIPT
+chmod 0755 /usr/local/bin/calc-deploy
+
+/usr/local/bin/calc-deploy 2>&1 | tee -a /var/log/calc-deploy.log
+touch /var/lib/calc-bootstrap-done

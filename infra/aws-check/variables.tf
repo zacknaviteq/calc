@@ -39,3 +39,14 @@ variable "git_repo_url" {
   type        = string
   default     = "https://github.com/zacknaviteq/calc.git"
 }
+
+variable "allowed_http_cidrs" {
+  description = "IPv4 CIDRs allowed to reach the app on port 80. Empty = blocked from the internet. Never add 0.0.0.0/0 here to keep it private."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !contains(var.allowed_http_cidrs, "0.0.0.0/0")
+    error_message = "0.0.0.0/0 would open the app to the whole internet."
+  }
+}
